@@ -2,7 +2,7 @@ from rpython.memory.gc.base import GCBase
 from rpython.rlib.rarithmetic import ovfcheck
 from rpython.rtyper.lltypesystem import lltype, llmemory, llgroup
 from rpython.rtyper.lltypesystem.lloperation import llop
-from rpython.rtyper.lltypesystem.llmemory import raw_malloc, raw_free
+from rpython.rtyper.lltypesystem.llmemory import NULL, raw_malloc, raw_free
 from rpython.rlib.rarithmetic import LONG_BIT
 
 first_gcflag = 1 << (LONG_BIT//2)
@@ -17,6 +17,7 @@ class SimpleMarkSweepGC(GCBase):
         # convenient function for setup
         GCBase.setup(self)
         self.address_space = self.AddressDeque()
+        self.objects_with_weakrefs = self.AddressStack()
 
     def malloc_fixedsize(self, typeid, size,
                                needs_finalizer=False,
@@ -29,6 +30,10 @@ class SimpleMarkSweepGC(GCBase):
         self.init_gc_object(result, typeid)
 
         self.address_space.append(result)
+
+        if contains_weakptr:
+            self.objects_with_weakrefs.append(result + size_gc_header)
+
         return llmemory.cast_adr_to_ptr(result+size_gc_header, llmemory.GCREF)
 
     def malloc_varsize(self, typeid, length, size, itemsize,
@@ -113,4 +118,27 @@ class SimpleMarkSweepGC(GCBase):
 
     def collect(self, generation=0):
         self.mark()
+        # there's some work we need to do before we can do a "simple" sweep
+        if self.objects_with_weakrefs.non_empty():
+            self.invalidate_weakrefs()
         self.sweep()
+
+    def invalidate_weakrefs(self):
+        # walk over list of objects that contain weakrefs
+        # if the object it references survives then update the weakref
+        # otherwise invalidate the weakref
+        new_with_weakref = self.AddressStack()
+        while self.objects_with_weakrefs.non_empty():
+            obj = self.objects_with_weakrefs.pop()
+            if not self.surviving(obj):
+                continue # weakref itself dies
+            offset = self.weakpointer_offset(self.get_type_id(obj))
+            pointing_to = (obj + offset).address[0]
+            # XXX I think that pointing_to cannot be NULL here
+            if pointing_to:
+                if self.surviving(pointing_to):
+                    new_with_weakref.append(obj)
+                else:
+                    (obj + offset).address[0] = NULL
+        self.objects_with_weakrefs.delete()
+        self.objects_with_weakrefs = new_with_weakref
