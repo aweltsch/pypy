@@ -115,6 +115,7 @@ class SimpleMarkSweepGC(GCBase):
             addr = prev_heap.popleft()
             hdr = llmemory.cast_adr_to_ptr(addr, lltype.Ptr(self.HDR))
             if hdr.tid & GCFLAG_SURVIVING:
+                hdr.tid = hdr.tid & ~GCFLAG_SURVIVING # clear flags
                 new_heap.append(addr)
             else:
                 raw_free(addr)
