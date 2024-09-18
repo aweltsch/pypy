@@ -18,6 +18,7 @@ class SimpleMarkSweepGC(GCBase):
         GCBase.setup(self)
         self.address_space = self.AddressDeque()
         self.objects_with_weakrefs = self.AddressStack()
+        self.objects_with_finalizers = self.AddressDeque()
 
     def malloc_fixedsize(self, typeid, size,
                                needs_finalizer=False,
@@ -30,6 +31,11 @@ class SimpleMarkSweepGC(GCBase):
         self.init_gc_object(result, typeid)
 
         self.address_space.append(result)
+
+        if needs_finalizer:
+            from rpython.rtyper.lltypesystem import rffi
+            self.objects_with_finalizers.append(result + size_gc_header)
+            self.objects_with_finalizers.append(rffi.cast(llmemory.Address, -1))
 
         if contains_weakptr:
             self.objects_with_weakrefs.append(result + size_gc_header)
@@ -116,12 +122,48 @@ class SimpleMarkSweepGC(GCBase):
         self.address_space.delete()
         self.address_space = new_heap
 
+    def register_finalizer(self, fq_index, gcobj):
+        from rpython.rtyper.lltypesystem import rffi
+        obj = llmemory.cast_ptr_to_adr(gcobj)
+        fq_index = rffi.cast(llmemory.Address, fq_index)
+        self.objects_with_finalizers.append(obj)
+        self.objects_with_finalizers.append(fq_index)
+
     def collect(self, generation=0):
         self.mark()
+        if self.objects_with_finalizers.non_empty():
+            scan = self.deal_with_objects_with_finalizers()
         # there's some work we need to do before we can do a "simple" sweep
         if self.objects_with_weakrefs.non_empty():
             self.invalidate_weakrefs()
+        self.execute_finalizers()
         self.sweep()
+
+
+    def deal_with_objects_with_finalizers(self):
+        new_with_finalizer = self.AddressDeque()
+        finalising = self.AddressDeque()
+
+        while self.objects_with_finalizers.non_empty():
+            x = self.objects_with_finalizers.popleft()
+            fq_nr = self.objects_with_finalizers.popleft()
+            if self.surviving(x):
+                new_with_finalizer.append(x)
+                new_with_finalizer.append(fq_nr)
+            else:
+                from rpython.rtyper.lltypesystem import rffi
+                fq_index = rffi.cast(lltype.Signed, fq_nr)
+                self.mark_finalizer_to_run(fq_index, x)
+                finalising.append(x)
+
+        # revive objects for finalizer runs
+        while finalising.non_empty():
+            x = finalising.popleft()
+            SimpleMarkSweepGC.mark_recursive(x, self)
+
+        self.objects_with_finalizers.delete()
+        self.objects_with_finalizers = new_with_finalizer
+        finalising.delete()
 
     def invalidate_weakrefs(self):
         # walk over list of objects that contain weakrefs
