@@ -19,6 +19,7 @@ class SimpleMarkSweepGC(GCBase):
         self.address_space = self.AddressDeque()
         self.objects_with_weakrefs = self.AddressStack()
         self.objects_with_finalizers = self.AddressDeque()
+        self.collection_lock = False
 
     def malloc_fixedsize(self, typeid, size,
                                needs_finalizer=False,
@@ -131,14 +132,23 @@ class SimpleMarkSweepGC(GCBase):
         self.objects_with_finalizers.append(fq_index)
 
     def collect(self, generation=0):
+        if self.collection_lock:
+            return
+        self.collection_lock = True
         self.mark()
         if self.objects_with_finalizers.non_empty():
             scan = self.deal_with_objects_with_finalizers()
         # there's some work we need to do before we can do a "simple" sweep
         if self.objects_with_weakrefs.non_empty():
             self.invalidate_weakrefs()
-        self.execute_finalizers()
+        # we first need to sweep objects that are definitely unreachable
+        # only after that we can execute the finalizers
+        # (any object with finalizer should be marked surviving)
+        # this is important because finalizers can introduce new objects
+        # which are not marked as surviving
         self.sweep()
+        self.execute_finalizers()
+        self.collection_lock = False
 
 
     def deal_with_objects_with_finalizers(self):
