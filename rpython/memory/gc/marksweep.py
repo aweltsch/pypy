@@ -1,8 +1,10 @@
+from rpython.rlib.debug import ll_assert
 from rpython.memory.gc.base import GCBase
 from rpython.rlib.rarithmetic import ovfcheck
 from rpython.rtyper.lltypesystem import lltype, llmemory, llgroup
 from rpython.rtyper.lltypesystem.lloperation import llop
 from rpython.rtyper.lltypesystem.llmemory import NULL, raw_malloc, raw_free
+from rpython.rtyper.lltypesystem.llmemory import raw_malloc_usage
 from rpython.rlib.rarithmetic import LONG_BIT
 
 first_gcflag = 1 << (LONG_BIT//2)
@@ -20,6 +22,10 @@ class SimpleMarkSweepGC(GCBase):
         self.objects_with_weakrefs = self.AddressStack()
         self.objects_with_finalizers = self.AddressDeque()
         self.collection_lock = False
+        self.heap_growth_factor = 2
+        self.initial_heap_size = 200
+        self.prev_heap_size = self.initial_heap_size
+        self.cur_heap_size = 0
 
     def malloc_fixedsize(self, typeid, size,
                                needs_finalizer=False,
@@ -28,6 +34,8 @@ class SimpleMarkSweepGC(GCBase):
         size_gc_header = self.gcheaderbuilder.size_gc_header
         totalsize = size_gc_header + size
 
+        if raw_malloc_usage(totalsize) + self.cur_heap_size > self.heap_growth_factor * self.prev_heap_size:
+            self.collect()
         result = raw_malloc(totalsize)
         self.init_gc_object(result, typeid)
 
@@ -41,6 +49,7 @@ class SimpleMarkSweepGC(GCBase):
         if contains_weakptr:
             self.objects_with_weakrefs.append(result + size_gc_header)
 
+        self.cur_heap_size += raw_malloc_usage(totalsize)
         return llmemory.cast_adr_to_ptr(result+size_gc_header, llmemory.GCREF)
 
     def malloc_varsize(self, typeid, length, size, itemsize,
@@ -53,6 +62,8 @@ class SimpleMarkSweepGC(GCBase):
         except OverflowError:
             raise memoryError
 
+        if raw_malloc_usage(totalsize) + self.cur_heap_size > self.heap_growth_factor * self.prev_heap_size:
+            self.collect()
         result = raw_malloc(totalsize)
         self.init_gc_object(result, typeid)
 
@@ -60,6 +71,7 @@ class SimpleMarkSweepGC(GCBase):
 
         (result + size_gc_header + offset_to_length).signed[0] = length
         res = llmemory.cast_adr_to_ptr(result+size_gc_header, llmemory.GCREF)
+        self.cur_heap_size += raw_malloc_usage(totalsize)
         return res
 
     def init_gc_object_immortal(self, addr, typeid16, flags=0):
@@ -119,8 +131,11 @@ class SimpleMarkSweepGC(GCBase):
                 hdr.tid = hdr.tid & ~GCFLAG_SURVIVING # clear flags
                 new_heap.append(addr)
             else:
+                size = self.get_size(addr + self.gcheaderbuilder.size_gc_header)
+                self.cur_heap_size -= raw_malloc_usage(size)
+                ll_assert(self.cur_heap_size >= 0, "miscalculation")
                 raw_free(addr)
-                
+
         self.address_space.delete()
         self.address_space = new_heap
 
@@ -148,6 +163,7 @@ class SimpleMarkSweepGC(GCBase):
         # which are not marked as surviving
         self.sweep()
         self.execute_finalizers()
+        self.prev_heap_size = self.cur_heap_size
         self.collection_lock = False
 
 
